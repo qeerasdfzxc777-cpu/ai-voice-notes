@@ -2,7 +2,434 @@
 cd ~
 git init
 git remote add origin https://github.com/qeerasdfzxc77-cpu/ai-voice-notes.git
-nano install_ai_voice_notes_v5.sh   # вставь туда код из моего сообщения
+nano install_ai_voice_notes_v5.sh   
+!/bin/bash
+set -euo pipefail
+
+# install_ai_voice_notes_v5.sh
+# Запускать от root (sudo)
+#
+# Особенности:
+# - Создаёт FastAPI-сервер /opt/voice_notes_server.py
+# - systemd-сервисы: voice-notes, ngrok-tunnel
+# - /admin защищён Basic Auth (user/pass сохраняются в /etc/voice_notes_admin_creds)
+# - Watchdog cron, MOTD status
+# - Ngrok туннель запускается с указанным доменом (NGROK_DOMAIN)
+#
+# ПРИМЕЧАНИЕ: По безопасности — храните файл /etc/voice_notes_admin_creds в секрете.
+
+NGROK_DOMAIN="fonda-ophiological-ecotypically.ngrok-free.dev"  # <- твой ngrok домен (как просил)
+FASTAPI_PORT=8000
+NGROK_API_PORT=4040
+WHISPER_DIR="/opt/whisper.cpp"
+WEB_DIR="/opt/web"
+NOTES_DIR="/opt/notes"
+ADMIN_CREDS_FILE="/etc/voice_notes_admin_creds"
+SERVICE_DIR="/etc/systemd/system"
+WATCHDOG_SCRIPT="/usr/local/bin/voice_watchdog.sh"
+ADMIN_LOGIN="admin"
+ADMIN_PASSWORD="2000"   # <- как ты указал. После установки рекомендуем сменить.
+
+echo "=== AI Voice Notes v5 — старт установки ==="
+echo "FASTAPI_PORT=$FASTAPI_PORT   NGROK_DOMAIN=$NGROK_DOMAIN"
+
+# --- Система и зависимости ---
+apt update -y
+apt upgrade -y
+apt install -y git curl ffmpeg python3 python3-pip cmake unzip jq net-tools lsof build-essential
+
+# --- Создание директорий ---
+mkdir -p "$WHISPER_DIR" "$WEB_DIR" "$NOTES_DIR"
+chmod 777 "$NOTES_DIR" "$WEB_DIR"
+
+# --- Whisper.cpp ---
+if [ ! -d "${WHISPER_DIR}/.git" ]; then
+  echo "Клонирую whisper.cpp в ${WHISPER_DIR}..."
+  git clone https://github.com/ggerganov/whisper.cpp.git "$WHISPER_DIR"
+fi
+cd "$WHISPER_DIR"
+make -j$(nproc) || true
+if [ ! -f "${WHISPER_DIR}/models/ggml-small.bin" ]; then
+  echo "Загружаю модель small..."
+  bash ./models/download-ggml-model.sh small || true
+fi
+
+# --- Ollama ---
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "Устанавливаю ollama..."
+  curl -fsSL https://ollama.com/install.sh | sh || true
+fi
+systemctl enable --now ollama || true
+sleep 5
+ollama pull mistral || true
+
+# --- ngrok (apt) ---
+if ! command -v ngrok >/dev/null 2>&1; then
+  echo "Устанавливаю ngrok..."
+  curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+  echo "deb https://ngrok-agent.s3.amazonaws.com buster main" > /etc/apt/sources.list.d/ngrok.list
+  apt update -y
+  apt install -y ngrok
+fi
+
+# --- Python deps ---
+pip install --upgrade pip
+pip install fastapi uvicorn python-multipart jinja2 aiofiles
+
+# --- Создаём admin creds (salt + sha256) ---
+if [ ! -f "$ADMIN_CREDS_FILE" ]; then
+  SALT="$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)"
+  HASH="$(printf "%s%s" "$SALT" "$ADMIN_PASSWORD" | sha256sum | awk '{print $1}')"
+  echo "user:${ADMIN_LOGIN}" > "$ADMIN_CREDS_FILE"
+  echo "salt:${SALT}" >> "$ADMIN_CREDS_FILE"
+  echo "hash:${HASH}" >> "$ADMIN_CREDS_FILE"
+  chmod 600 "$ADMIN_CREDS_FILE"
+  echo "Сохранены admin-учётные данные в $ADMIN_CREDS_FILE"
+else
+  echo "Файл $ADMIN_CREDS_FILE уже существует — пропускаю создание (если нужно, отредактируй вручную)."
+fi
+
+# --- HTML интерфейс ---
+cat > "$WEB_DIR/index.html" <<'HTML'
+<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="utf-8"/><title>AI Voice Notes</title><style>
+body{font-family:sans-serif;background:#fafafa;margin:40px}.card{background:#fff;padding:20px;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,0.08);width:560px}
+textarea{width:100%;height:200px;margin-top:12px;padding:10px;border-radius:8px;border:1px solid #ddd}button{padding:10px 16px;border-radius:8px;border:none;background:#1976d2;color:#fff;cursor:pointer}
+</style></head>
+<body>
+<div class="card"><h2>🎙 Voice → Note</h2>
+<input type="file" id="file" accept="audio/*"/><br/><button onclick="send()">Отправить</button>
+<h3>Результат</h3><textarea id="res" readonly></textarea>
+<p><a href="/admin" target="_blank">Открыть панель администратора</a></p></div>
+<script>
+async function send(){
+  const f=document.getElementById('file'); if(!f.files.length)return alert('Выберите файл');
+  const fd=new FormData(); fd.append('file',f.files[0]);
+  const r=await fetch('/voice-to-note',{method:'POST',body:fd});
+  const j=await r.json(); document.getElementById('res').value=j.note||JSON.stringify(j);
+}
+</script>
+</body>
+</html>
+HTML
+
+# --- Admin HTML (login + panel) ---
+cat > "$WEB_DIR/admin.html" <<'HTML'
+<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="utf-8"/><title>Admin — Voice Notes</title><style>
+body{font-family:sans-serif;background:#f3f3f3;margin:20px} .card{background:#fff;padding:16px;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.06)}
+input{padding:6px;margin:6px}
+button{padding:6px 10px}
+pre{background:#111;color:#0f0;padding:10px;border-radius:6px;overflow:auto}
+</style></head>
+<body>
+<div class="card">
+  <h2>🧠 Admin Panel</h2>
+  <div>
+    <label>Login: <input id="login" value="admin"/></label>
+    <label>Password: <input id="password" type="password"/></label>
+    <button onclick="auth()">Login</button>
+  </div>
+  <div id="panel" style="display:none">
+    <h3>Services</h3><div id="services"></div>
+    <h3>Ngrok URL</h3><div id="ngrok"></div>
+    <h3>Notes</h3><ul id="notes"></ul>
+    <h3>Logs</h3><pre id="logs"></pre>
+  </div>
+</div>
+<script>
+let authHeader = null;
+function setAuth(user, pass){
+  authHeader = 'Basic ' + btoa(user+':'+pass);
+}
+async function auth(){
+  const user=document.getElementById('login').value;
+  const pass=document.getElementById('password').value;
+  setAuth(user, pass);
+  // test request
+  const r = await fetch('/admin/status', {headers: { 'Authorization': authHeader }});
+  if(r.status===401 || r.status===403){ alert('Auth failed'); return; }
+  document.getElementById('panel').style.display='block';
+  load();
+}
+async function load(){
+  const r = await fetch('/admin/status', {headers: { 'Authorization': authHeader }});
+  const j = await r.json();
+  document.getElementById('services').innerHTML = j.services.map(s=>`<div>${s.name} — ${s.active} <button onclick="restart('${s.name}')">restart</button> <button onclick="showLogs('${s.name}')">logs</button></div>`).join('');
+  document.getElementById('ngrok').innerText = j.ngrok_url || '—';
+  document.getElementById('notes').innerHTML = j.notes.map(n=>`<li><a href="/notes/${n}" target="_blank">${n}</a></li>`).join('');
+}
+async function restart(name){
+  await fetch('/admin/restart/'+encodeURIComponent(name), {method:'POST', headers: { 'Authorization': authHeader }});
+  load();
+}
+async function showLogs(name){
+  const r = await fetch('/admin/logs?name='+encodeURIComponent(name), {headers: { 'Authorization': authHeader }});
+  const j = await r.json(); document.getElementById('logs').innerText = j.logs || JSON.stringify(j);
+}
+</script>
+</body>
+</html>
+HTML
+
+# --- FastAPI сервер (с BasicAuth проверкой) ---
+cat > /opt/voice_notes_server.py <<'PY'
+from fastapi import FastAPI, UploadFile, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+import os, subprocess, glob, json, base64, hashlib, time
+from datetime import datetime
+
+app = FastAPI()
+NOTES_DIR = "/opt/notes"
+WEB_DIR = "/opt/web"
+WHISPER_DIR = "/opt/whisper.cpp"
+MODEL_PATH = os.path.join(WHISPER_DIR, "models", "ggml-small.bin")
+ADMIN_CREDS_FILE = "/etc/voice_notes_admin_creds"
+app.mount("/notes", StaticFiles(directory=NOTES_DIR), name="notes")
+
+def read_admin_creds():
+    try:
+        data = {}
+        with open(ADMIN_CREDS_FILE, "r") as f:
+            for line in f:
+                if ":" in line:
+                    k,v = line.strip().split(":",1)
+                    data[k]=v
+        return data
+    except Exception:
+        return None
+
+def check_basic_auth(request: Request):
+    # Accept Basic header "Authorization: Basic base64(user:pass)"
+    auth = request.headers.get("authorization")
+    user=None; passwd=None
+    if auth and auth.lower().startswith("basic "):
+        try:
+            b = auth.split(" ",1)[1].strip()
+            u_p = base64.b64decode(b).decode()
+            user, passwd = u_p.split(":",1)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid auth")
+    else:
+        # allow credentials via query params for convenience (not recommended)
+        params = request.query_params
+        if "user" in params and "pass" in params:
+            user = params["user"]; passwd = params["pass"]
+    if not user:
+        raise HTTPException(status_code=401, detail="Auth required")
+    creds = read_admin_creds()
+    if not creds:
+        raise HTTPException(status_code=500, detail="Admin creds file missing")
+    salt = creds.get("salt")
+    stored_hash = creds.get("hash")
+    if not salt or not stored_hash:
+        raise HTTPException(status_code=500, detail="Admin creds malformed")
+    h = hashlib.sha256((salt+passwd).encode()).hexdigest()
+    if h != stored_hash or user != creds.get("user"):
+        raise HTTPException(status_code=403, detail="Invalid credentials")
+    return True
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return open(os.path.join(WEB_DIR,"index.html"), "r", encoding="utf-8").read()
+
+@app.post("/voice-to-note")
+async def voice_to_note(file: UploadFile):
+    filename = file.filename or f"upload_{int(time.time())}.wav"
+    audio_path = f"/tmp/{filename}"
+    with open(audio_path, "wb") as f:
+        f.write(await file.read())
+    whisper_bin = os.path.join(WHISPER_DIR, "main")
+    try:
+        subprocess.run([whisper_bin, "-m", MODEL_PATH, "-f", audio_path, "-l", "ru", "-otxt"], cwd=WHISPER_DIR, check=True, timeout=300)
+    except subprocess.CalledProcessError as e:
+        return JSONResponse({"error":"whisper failed", "detail": str(e)}, status_code=500)
+    txt = audio_path + ".txt"
+    if not os.path.exists(txt):
+        return JSONResponse({"error":"whisper output missing"}, status_code=500)
+    with open(txt, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+    # call ollama
+    prompt = f"Сделай краткую и понятную заметку из следующего текста:\\n{text}"
+    try:
+        note = subprocess.check_output(["ollama","run","mistral"], input=prompt.encode("utf-8"), timeout=60).decode().strip()
+    except Exception:
+        note = text[:400]
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    outp = os.path.join(NOTES_DIR, ts + ".txt")
+    with open(outp, "w", encoding="utf-8") as f:
+        f.write(note)
+    try:
+        os.remove(audio_path)
+        os.remove(txt)
+    except Exception:
+        pass
+    return {"note": note, "saved_to": outp}
+
+# --- Admin endpoints (require auth) ---
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(request: Request):
+    check_basic_auth(request)
+    return open(os.path.join(WEB_DIR,"admin.html"), "r", encoding="utf-8").read()
+
+@app.get("/admin/status")
+def admin_status(request: Request):
+    check_basic_auth(request)
+    services = []
+    for s in ["ollama","voice-notes","ngrok-tunnel"]:
+        try:
+            out = subprocess.check_output(["systemctl","show", s, "-p", "ActiveState,ActiveEnterTimestamp"], stderr=subprocess.STDOUT).decode()
+            data={}
+            for line in out.splitlines():
+                if "=" in line:
+                    k,v=line.split("=",1); data[k]=v
+            services.append({"name":s,"active": data.get("ActiveState","unknown"), "since": data.get("ActiveEnterTimestamp","-")})
+        except Exception:
+            services.append({"name":s,"active":"unknown","since":"-"})
+    # ngrok url
+    try:
+        import urllib.request, json
+        with urllib.request.urlopen(f"http://127.0.0.1:{NGROK_API_PORT}/api/tunnels", timeout=2) as r:
+            j = json.load(r)
+            public = j.get("tunnels",[{}])[0].get("public_url","")
+    except Exception:
+        public = ""
+    notes = sorted(os.listdir(NOTES_DIR))[-50:][::-1] if os.path.exists(NOTES_DIR) else []
+    return {"services":services, "ngrok_url": public, "notes": notes}
+
+@app.post("/admin/restart/{service}")
+def admin_restart(request: Request, service: str):
+    check_basic_auth(request)
+    if service not in ["ollama","voice-notes","ngrok-tunnel"]:
+        raise HTTPException(status_code=400, detail="Unknown service")
+    try:
+        subprocess.check_call(["systemctl","restart",service])
+        return {"result":"restarted", "service": service}
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/logs")
+def admin_logs(request: Request, name: str, lines: int = 200):
+    check_basic_auth(request)
+    if name not in ["ollama","voice-notes","ngrok-tunnel"]:
+        raise HTTPException(status_code=400, detail="Unknown service")
+    try:
+        out = subprocess.check_output(["journalctl","-u", name, "-n", str(lines), "--no-pager"], stderr=subprocess.STDOUT).decode("utf-8", errors="ignore")
+        return {"service": name, "logs": out}
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+PY
+
+# --- Systemd сервисы ---
+cat > "${SERVICE_DIR}/voice-notes.service" <<EOF
+[Unit]
+Description=Voice Notes FastAPI Server
+After=network.target ollama.service
+
+[Service]
+ExecStart=/usr/bin/env uvicorn /opt/voice_notes_server:app --host 0.0.0.0 --port ${FASTAPI_PORT}
+WorkingDirectory=/opt
+Restart=always
+RestartSec=3
+User=root
+Environment="PATH=/usr/bin:/usr/local/bin"
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > "${SERVICE_DIR}/ngrok-tunnel.service" <<EOF
+[Unit]
+Description=Ngrok Tunnel for Voice Notes
+After=voice-notes.service
+
+[Service]
+ExecStart=/usr/bin/ngrok http --domain=${NGROK_DOMAIN} ${FASTAPI_PORT} --log=stdout
+Restart=always
+RestartSec=3
+User=root
+WorkingDirectory=/root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- Reload systemd and start services ---
+systemctl daemon-reload
+systemctl enable --now voice-notes ngrok-tunnel ollama || true
+systemctl restart voice-notes ngrok-tunnel ollama || true
+sleep 4
+
+# --- Watchdog ---
+cat > "$WATCHDOG_SCRIPT" <<'WD'
+#!/bin/bash
+SERVICES=("ollama" "voice-notes" "ngrok-tunnel")
+for S in "${SERVICES[@]}"; do
+  if ! systemctl is-active --quiet "$S"; then
+    echo "[$(date)] $S is not active. restarting..."
+    systemctl restart "$S"
+  fi
+done
+WD
+chmod +x "$WATCHDOG_SCRIPT"
+( crontab -l 2>/dev/null || true; echo "*/2 * * * * $WATCHDOG_SCRIPT >/dev/null 2>&1" ) | crontab -
+
+# --- MOTD ---
+cat > /etc/update-motd.d/99-voice-notes-status <<'MOTD'
+#!/bin/bash
+echo ""
+echo "🧠 Voice Notes AI Status Dashboard"
+echo "-----------------------------------------"
+printf "%-15s %-20s\n" "Сервис" "Статус"
+for s in ollama voice-notes ngrok-tunnel; do
+  STAT=$(systemctl is-active $s 2>/dev/null || echo "unknown")
+  ENTER=$(systemctl show -p ActiveEnterTimestamp $s 2>/dev/null | cut -d'=' -f2-)
+  if [ "$STAT" = "active" ]; then
+    printf "%-15s ✅ %-20s\n" "$s" "$ENTER"
+  else
+    printf "%-15s ❌ %-20s\n" "$s" "$ENTER"
+  fi
+done
+NGROK_URL=$(curl -s http://127.0.0.1:${NGROK_API_PORT}/api/tunnels | jq -r '.tunnels[0].public_url' 2>/dev/null || echo "")
+if [ -z "$NGROK_URL" ]; then
+  echo "🌍 Ngrok URL: ⏳ загрузка..."
+else
+  echo "🌍 Ngrok URL: $NGROK_URL"
+fi
+echo ""
+echo "Основные команды:"
+echo " systemctl restart voice-notes"
+echo " systemctl restart ngrok-tunnel"
+echo " journalctl -u voice-notes -f"
+echo "-----------------------------------------"
+MOTD
+chmod +x /etc/update-motd.d/99-voice-notes-status
+
+# --- Финальные сообщения ---
+echo ""
+echo "=== Установка завершена ==="
+echo "FastAPI: http://<server-ip>:${FASTAPI_PORT} (локально)"
+echo "Ngrok URL (домен): https://${NGROK_DOMAIN}"
+echo "Admin login: ${ADMIN_LOGIN}"
+echo "Admin password: (как ты указал при установке) — ${ADMIN_PASSWORD}"
+echo ""
+echo "Admin creds file: ${ADMIN_CREDS_FILE} (chmod 600)"
+echo ""
+echo "Покажи /etc/voice_notes_admin_creds содержимое только себе, не выкладывай в публичные места."
+echo ""
+echo "Проверка статусов:"
+systemctl status voice-notes --no-pager || true
+systemctl status ngrok-tunnel --no-pager || true
+echo ""
+echo "Чтобы получить ngrok public URL вручную (если нужен):"
+echo "  curl -s http://127.0.0.1:${NGROK_API_PORT}/api/tunnels | jq -r '.tunnels[0].public_url'"
+echo ""
+echo "Готово."
+
 git add install_ai_voice_notes_v5.sh
 git commit -m "initial installer"
 git branch -M main
